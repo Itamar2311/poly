@@ -40,7 +40,7 @@ from datetime import datetime
 import polymarket_signals as ps
 
 STAKE = 1.0
-MIN_SCORE_SINGLE = 65
+MIN_SCORE_SINGLE = 55
 MIN_SCORE_GROUP = 55          # 2+ traders
 MIN_EDGE = 0.10
 MAX_REALISTIC_EDGE = 0.35
@@ -50,14 +50,28 @@ MIN_LIQUIDITY = 20 * STAKE
 MAX_NEW_PER_DAY = 20
 EXIT_EDGE_DROP = 0.05
 EXIT_SOLD_SHARE = 0.5
+# Markets on one of these topics move together even across different events (October,
+# December and January Fed meetings, "another hike in 2026"...): one open bet per topic.
+# Everything else: one open bet per event (one game, one city-day, one speech).
+# In priority order: a market tagged with several counts under the first one listed.
+CORRELATED_TOPICS = ["fed-rates", "fomc", "interest-rates", "inflation", "cpi", "cpi-release",
+                     "jobs-report", "unemployment", "gdp", "recession", "tariffs"]
+
+
+def topic_of(event_slug):
+    """The bet's correlation group: a shared macro topic, or else the event itself."""
+    tags = ps.market_tags(event_slug)
+    return next(("topic:" + t for t in CORRELATED_TOPICS if t in tags), event_slug)
 
 PAPER_STATE = "paper_trades.json"
 PAPER = "paper_trades.csv"
+DAILY = "paper_daily.csv"
+DASHBOARD = "paper_dashboard.html"
 CANDIDATES = "candidates.csv"
 NOTIFY = True
-PAPER_FIELDS = ["trade_id", "status", "opened", "group", "market", "side", "num_traders",
+PAPER_FIELDS = ["trade_id", "status", "opened", "group", "topic", "event", "market", "side", "num_traders",
                 "score", "entry_price", "stake", "shares", "entry_model_prob", "entry_edge",
-                "current_price", "current_value", "pnl", "current_edge", "traders_sold",
+                "current_price", "current_value", "profit_usd", "current_edge", "traders_sold",
                 "closed", "exit_price", "exit_reason", "traders", "url", "condition_id",
                 "wallets", "backer_sizes", "raw_values"]
 CANDIDATE_FIELDS = ["time", "decision", "reasons", "group", "market", "side", "num_traders",
@@ -127,17 +141,107 @@ def evaluate(group, snap, traders, records, names):
 
 
 def load_paper():
+    """(trades, daily totals) from paper_trades.json."""
     if not os.path.exists(PAPER_STATE):
-        return []
+        return [], {}
     with open(PAPER_STATE, encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+    trades, daily = (state, {}) if isinstance(state, list) else (state["trades"], state["daily"])
+    for t in trades:                          # trades saved by an older version
+        if "pnl" in t:
+            t["profit_usd"] = t.pop("pnl")
+        t.setdefault("event", t["url"].rsplit("/", 1)[-1])
+        t.setdefault("topic", topic_of(t["event"]))
+    return trades, daily
 
 
-def save_paper(trades):
+def save_paper(trades, daily):
     tmp = PAPER_STATE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(trades, f, indent=1)
+        json.dump({"trades": trades, "daily": daily}, f, indent=1)
     os.replace(tmp, PAPER_STATE)
+
+
+def daily_rows(trades, daily):
+    """One row per day: trades opened / closed, realized profit, total and daily profit."""
+    rows, prev_total = [], 0.0
+    for day in sorted(daily):
+        total = daily[day]
+        rows.append({
+            "date": day,
+            "trades_opened": sum(t["opened"].startswith(day) for t in trades),
+            "trades_closed": sum((t.get("closed") or "").startswith(day) for t in trades),
+            "realized_profit_usd": round(sum(float(t["profit_usd"]) for t in trades
+                                             if (t.get("closed") or "").startswith(day)), 2),
+            "total_profit_usd": round(total, 2),
+            "daily_profit_usd": round(total - prev_total, 2),
+        })
+        prev_total = total
+    return rows
+
+
+def write_dashboard(trades, days):
+    """paper_dashboard.html - reloads itself every minute in the browser."""
+    from html import escape
+    total = sum(float(t["profit_usd"] or 0) for t in trades)
+    staked = sum(float(t["stake"]) for t in trades)
+    closed = [t for t in trades if t["status"] == "closed"]
+    wins = sum(float(t["profit_usd"]) > 0 for t in closed)
+    today = days[-1]["daily_profit_usd"] if days else 0.0
+
+    def money(x):
+        x = float(x or 0)
+        return f'<span class="{"pos" if x > 0 else "neg" if x < 0 else ""}">{x:+.2f}</span>'
+
+    trade_rows = "".join(
+        f"<tr><td>{escape(t['status'])}</td><td>{escape(t['opened'])}</td>"
+        f"<td>{escape(t['group'])}</td><td><a href='{escape(t['url'])}'>{escape(t['market'])}</a></td>"
+        f"<td>{escape(t['side'])}</td><td>{t['num_traders']}</td>"
+        f"<td>{float(t['entry_price']) * 100:.0f}c</td><td>{float(t['current_price']) * 100:.0f}c</td>"
+        f"<td>{float(t['current_edge'] or 0) * 100:+.0f}</td><td>{escape(str(t['traders_sold']))}</td>"
+        f"<td>{money(t['profit_usd'])}</td><td>{escape(t.get('exit_reason') or '')}</td></tr>"
+        for t in sorted(trades, key=lambda t: (t["status"] != "open", t["opened"]), reverse=False))
+    day_rows = "".join(
+        f"<tr><td>{d['date']}</td><td>{d['trades_opened']}</td><td>{d['trades_closed']}</td>"
+        f"<td>{money(d['realized_profit_usd'])}</td><td>{money(d['daily_profit_usd'])}</td>"
+        f"<td>{money(d['total_profit_usd'])}</td></tr>" for d in reversed(days))
+    page = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="60"><title>Paper trades</title>
+<style>
+:root {{ --bg:#fff; --fg:#111; --muted:#666; --line:#e4e4e4; --pos:#0a7d32; --neg:#c62828; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#161616; --fg:#eee; --muted:#999;
+  --line:#333; --pos:#4cc777; --neg:#ff6b6b; }} }}
+body {{ background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif; margin:24px; }}
+h1 {{ font-size:20px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 8px; }}
+.sub {{ color:var(--muted); margin-bottom:16px; }}
+.tiles {{ display:flex; gap:24px; flex-wrap:wrap; }} .tile b {{ display:block; font-size:22px; }}
+table {{ border-collapse:collapse; width:100%; }} th, td {{ padding:6px 8px;
+  border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
+th {{ color:var(--muted); font-weight:500; }} a {{ color:inherit; }}
+.pos {{ color:var(--pos); }} .neg {{ color:var(--neg); }}
+.wrap {{ overflow-x:auto; }}
+</style></head><body>
+<h1>Paper trades</h1>
+<div class="sub">$1 imaginary bets - updated {datetime.now():%Y-%m-%d %H:%M} - page reloads every minute</div>
+<div class="tiles">
+ <div class="tile">Total profit<b>{money(total)} $</b></div>
+ <div class="tile">Today<b>{money(today)} $</b></div>
+ <div class="tile">Staked<b>${staked:.0f}</b></div>
+ <div class="tile">Return<b>{(total / staked * 100 if staked else 0):+.1f}%</b></div>
+ <div class="tile">Open / closed<b>{len(trades) - len(closed)} / {len(closed)}</b></div>
+ <div class="tile">Closed won<b>{wins}/{len(closed)}</b></div>
+</div>
+<h2>Daily profit</h2><div class="wrap"><table>
+<tr><th>Date</th><th>Opened</th><th>Closed</th><th>Realized $</th><th>Daily profit $</th><th>Total $</th></tr>
+{day_rows}</table></div>
+<h2>Trades</h2><div class="wrap"><table>
+<tr><th>Status</th><th>Opened</th><th>Group</th><th>Market</th><th>Side</th><th>Traders</th>
+<th>Bought</th><th>Now</th><th>Edge</th><th>Sold</th><th>Profit $</th><th>Exit</th></tr>
+{trade_rows}</table></div></body></html>"""
+    tmp = DASHBOARD + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(page)
+    os.replace(tmp, DASHBOARD)
 
 
 def write_csv(path, fields, rows):
@@ -159,9 +263,9 @@ def close(t, price, reason, stamp):
     t.update(status="closed", closed=stamp, exit_price=round(price, 4), exit_reason=reason,
              current_price=round(price, 4))
     t["current_value"] = round(float(t["shares"]) * price, 4)
-    t["pnl"] = round(float(t["current_value"]) - float(t["stake"]), 4)
+    t["profit_usd"] = round(float(t["current_value"]) - float(t["stake"]), 4)
     if NOTIFY:
-        ps.notify(f"Paper trade closed: {t['pnl']:+.2f} $ ({reason})",
+        ps.notify(f"Paper trade closed: {t['profit_usd']:+.2f} $ ({reason})",
                   f"{t['market']} -> {t['side']}\n"
                   f"bought {float(t['entry_price']) * 100:.0f}c, sold {price * 100:.0f}c")
 
@@ -180,7 +284,7 @@ def manage_open(trades, stamp):
             continue
         t["current_price"] = round(price, 4)
         t["current_value"] = round(float(t["shares"]) * price, 4)
-        t["pnl"] = round(float(t["current_value"]) - float(t["stake"]), 4)
+        t["profit_usd"] = round(float(t["current_value"]) - float(t["stake"]), 4)
 
         raw = json.loads(t["raw_values"])
         avg = float(raw.get("avg_price") or t["entry_price"])
@@ -210,7 +314,7 @@ def run(snaps, traders, records, names):
     model = ps.load_model()
     if not model or "snapshots" not in model:     # only a model trained on training.csv
         return "paper: waiting for model.R to be trained on training.csv"
-    trades = load_paper()
+    trades, daily = load_paper()
     manage_open(trades, stamp)
 
     # latest snapshot per group / market / side = how many agree right now
@@ -220,20 +324,23 @@ def run(snaps, traders, records, names):
             latest[group, s["cid"], s["idx"]] = s
     evaluated = [e for (group, _, _), s in latest.items()
                  if (e := evaluate(group, s, traders, records, names))]
-    evaluated.sort(key=lambda e: -(e["edge"] or -1))
+    evaluated.sort(key=lambda e: -(e["edge"] or -1))       # best edge first
 
-    held = {(t["condition_id"], t["side"]) for t in trades if t["status"] == "open"}
+    # one open bet per event / correlated topic (see CORRELATED_TOPICS)
+    held_topics = {t["topic"] for t in trades if t["status"] == "open"}
     opened_today = sum(t["opened"].startswith(today) for t in trades)
     new, rows = [], []
     for e in evaluated:
-        key = (e["cid"], e["side"])
-        if not e["reasons"] and key in held:
-            e["reasons"].append("already holding")
+        event = e["market"]["slug"]
+        topic = topic_of(event)
+        if not e["reasons"] and topic in held_topics:
+            e["reasons"].append("already betting on this "
+                                + ("topic" if topic.startswith("topic:") else "event"))
         if not e["reasons"] and opened_today + len(new) >= MAX_NEW_PER_DAY:
             e["reasons"].append("daily limit")
         decision = "APPROVED" if not e["reasons"] else "rejected"
         if decision == "APPROVED":
-            held.add(key)
+            held_topics.add(topic)
             new.append(e)
         rows.append({"time": stamp, "decision": decision, "reasons": "; ".join(e["reasons"]),
                      "group": e["group"], "market": e["market"]["title"], "side": e["side"],
@@ -241,17 +348,19 @@ def run(snaps, traders, records, names):
                      "price": e["price"], "model_prob": e["prob"], "model_edge": e["edge"],
                      "opposing_share": round(e["opp_share"], 3),
                      "liquidity": round(e["state"]["liquidity"]), "traders": e["traders"],
-                     "url": f"https://polymarket.com/event/{e['market']['slug']}",
+                     "url": f"https://polymarket.com/event/{event}",
                      "condition_id": e["cid"]})
 
     for e in new:
         trades.append({
             "trade_id": f"{now:%Y%m%d%H%M}-{len(trades) + 1}", "status": "open",
-            "opened": stamp, "group": e["group"], "market": e["market"]["title"],
+            "opened": stamp, "group": e["group"], "event": e["market"]["slug"],
+            "topic": topic_of(e["market"]["slug"]),
+            "market": e["market"]["title"],
             "side": e["side"], "num_traders": e["k"], "score": round(e["score"], 1),
             "entry_price": e["price"], "stake": STAKE, "shares": round(STAKE / e["price"], 4),
             "entry_model_prob": e["prob"], "entry_edge": e["edge"],
-            "current_price": e["price"], "current_value": STAKE, "pnl": 0.0,
+            "current_price": e["price"], "current_value": STAKE, "profit_usd": 0.0,
             "current_edge": e["edge"], "traders_sold": f"0/{e['k']}",
             "traders": e["traders"], "url": f"https://polymarket.com/event/{e['market']['slug']}",
             "condition_id": e["cid"], "wallets": ";".join(e["order"]),
@@ -260,19 +369,23 @@ def run(snaps, traders, records, names):
             "raw_values": ps.dump_raw({**e["raw"], "avg_price": e["avg"]}),
         })
 
-    save_paper(trades)             # the record first, then the views
+    total = sum(float(t["profit_usd"] or 0) for t in trades)
+    daily[today] = round(total, 4)           # total profit (closed + open at market) today
+    save_paper(trades, daily)                # the record first, then the views
     for e in new:
         if NOTIFY:
             ps.notify(f"Paper trade: $1 on {e['side']} @ {e['price'] * 100:.0f}c "
                       f"(model {e['prob'] * 100:.0f}%, edge {e['edge'] * 100:+.0f})",
                       f"{e['market']['title']}\n{e['group']} - {e['k']} trader(s) - "
                       f"score {e['score']:.0f}")
+    days = daily_rows(trades, daily)
     write_csv(CANDIDATES, CANDIDATE_FIELDS, rows)
+    write_csv(DAILY, list(days[0]) if days else ["date"], days)
     exported = write_csv(PAPER, PAPER_FIELDS,
                          sorted(trades, key=lambda t: (t["status"] != "open", t["opened"])))
+    write_dashboard(trades, days)
     open_trades = [t for t in trades if t["status"] == "open"]
     closed = [t for t in trades if t["status"] == "closed"]
-    pnl = sum(float(t["pnl"] or 0) for t in trades)
     return (f"paper: {len(new)} new, {len(open_trades)} open, {len(closed)} closed, "
-            f"total P&L ${pnl:+.2f} on ${STAKE * len(trades):.0f} staked"
+            f"total P&L ${total:+.2f} on ${STAKE * len(trades):.0f} staked"
             + ("" if exported else f" ({PAPER} open elsewhere - export skipped)"))

@@ -30,3 +30,5 @@ candidates.csv
 plots/
 .Rhistory
 .RData
+paper_daily.csv
+paper_dashboard.html
