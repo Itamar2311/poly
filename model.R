@@ -27,7 +27,9 @@ set.seed(42)          # cross-validation is random; this makes runs repeatable
 # ---- 1. load ------------------------------------------------------------------
 read_signals <- function(path, source) {
   if (!file.exists(path)) return(NULL)
-  d <- read.csv(path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+  # condition_id looks like "0x12ab..." - without colClasses R reads it as a hex number
+  d <- read.csv(path, stringsAsFactors = FALSE, fileEncoding = "UTF-8",
+                colClasses = c(condition_id = "character"))
   if (!"raw_values" %in% names(d)) return(NULL)
   d |> transmute(date, group, market, side, score = as.numeric(score),
                  entry_price = as.numeric(entry_price), result, raw_values,
@@ -63,13 +65,20 @@ for (k in raw_names) {
 # Leaderboard rank / ROI and liquidity are unknown for backfilled days, so they are
 # filled with the average and a 0/1 column `has_live_data` lets the model tell them apart.
 fill <- function(x, value) ifelse(is.na(x), value, x)
+# averages used to fill gaps - saved with the model so Python fills gaps the same way
+fills <- list(
+  win_rate      = mean(signals$win_rate_raw, na.rm = TRUE),
+  lb_rank       = mean(signals$lb_rank, na.rm = TRUE),
+  lb_roi        = mean(signals$lb_roi, na.rm = TRUE),
+  log_liquidity = mean(log10(signals$liquidity_usd + 1), na.rm = TRUE))
+fills <- lapply(fills, function(v) if (is.nan(v)) 0 else v)   # no data at all -> 0
 d <- signals |>
   transmute(
     won, group,
     edge              = fill(edge_raw, 0),                 # wins - expected wins, per bet
     recent_edge       = fill(recent_edge_raw, 0),          # same, last 14 days
     coin_flip_rate    = fill(coin_flip_rate, 0.5),         # win rate on 40-60c bets
-    win_rate          = fill(win_rate_raw, mean(win_rate_raw, na.rm = TRUE)),
+    win_rate          = fill(win_rate_raw, fills$win_rate),
     log_bets          = log10(fill(bets, 0) + 1),          # experience (10x bets = +1)
     our_avg_return    = fill(our_avg_return, 0),           # their past signals' avg return
     log_our_signals   = log10(fill(our_signals, 0) + 1),
@@ -79,11 +88,12 @@ d <- signals |>
     price_move_cents  = fill(price_move_cents, 0),         # entry - traders' avg price
     log_days_to_end   = log10(pmax(fill(days_to_end, 1), 0) + 0.1),
     has_live_data     = as.integer(!is.na(lb_rank)),
-    lb_rank           = fill(lb_rank, mean(lb_rank, na.rm = TRUE)),
-    lb_roi            = fill(lb_roi, mean(lb_roi, na.rm = TRUE)),
-    log_liquidity     = fill(log10(liquidity_usd + 1), mean(log10(liquidity_usd + 1), na.rm = TRUE))
+    lb_rank           = fill(lb_rank, fills$lb_rank),
+    lb_roi            = fill(lb_roi, fills$lb_roi),
+    log_liquidity     = fill(log10(liquidity_usd + 1), fills$log_liquidity)
   )
-d[is.na(d)] <- 0   # if a column is entirely missing (e.g. no live data yet), mean() gives NA
+d[is.na(d)] <- 0   # anything still missing (e.g. 0 traders' history) counts as 0
+# (polymarket_signals.py -> model_features() rebuilds exactly these columns in Python)
 
 # design matrix: every variable + one column per group + "does agreement matter
 # differently per group" (num_traders x group interaction)
@@ -130,7 +140,8 @@ cat("\nCoefficients (0 = dropped; + = raises the odds of winning beyond the pric
 print(round(coefs[coefs != 0], 3))
 
 write_json(list(trained = format(Sys.time()), settled_signals = nrow(d),
-                intercept = unname(coefs[1]), coefficients = as.list(coefs[-1])),
+                intercept = unname(coefs[1]), coefficients = as.list(coefs[-1]),
+                fills = fills),
            "model_coefficients.json", auto_unbox = TRUE, pretty = TRUE, digits = 6)
 
 

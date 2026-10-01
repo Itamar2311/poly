@@ -35,7 +35,7 @@ LOG = "live_log.txt"
 LEADERBOARD_REFRESH = 3600   # seconds
 NOTIFY = True                # Windows pop-up for each alert
 ALERT_FIELDS = ["time", "group", "market", "side", "num_traders", "total_usdc", "price_now",
-                "traders", "trader_scores", "url", "condition_id"]
+                "model_prob", "model_edge", "traders", "trader_scores", "url", "condition_id"]
 
 
 def log(msg):
@@ -67,7 +67,23 @@ class Tracker:
         self.tokens = {}         # outcome token id -> market info (or None if unknown)
         self.traders = ps.load_traders()   # cached stats from the hourly script, for scores
         self.leaderboards_at = 0
+        self.upgrade_alerts_file()
         self.new_day()
+
+    @staticmethod
+    def upgrade_alerts_file():
+        """Rewrite an alerts.csv made by an older version with the current columns."""
+        if not os.path.exists(ALERTS):
+            return
+        with open(ALERTS, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames == ALERT_FIELDS:
+                return
+            rows = list(reader)
+        with open(ALERTS, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=ALERT_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
 
     # --- state ------------------------------------------------------------
     def new_day(self):
@@ -94,8 +110,14 @@ class Tracker:
                             orderBy="PNL", limit=ps.TOP_N):
                 w = t["proxyWallet"]
                 entry = watch.setdefault(w.lower(), {"wallet": w, "groups": set(),
-                                                     "name": t.get("userName") or w[:10]})
+                                                     "name": t.get("userName") or w[:10],
+                                                     "rank": int(t["rank"]),
+                                                     "pnl": t.get("pnl") or 0,
+                                                     "vol": t.get("vol") or 0})
                 entry["groups"].add(group)
+                if int(t["rank"]) < entry["rank"]:          # keep their best rank
+                    entry.update(rank=int(t["rank"]), pnl=t.get("pnl") or 0,
+                                 vol=t.get("vol") or 0)
         new = set(watch) - set(self.watch)
         self.watch = watch
         self.leaderboards_at = time.time()
@@ -183,18 +205,41 @@ class Tracker:
         return out
 
     def check(self, group, cid, yes_price):
-        for side, backers in self.signal_sides(cid, self.net[group, cid]):
+        by_wallet = self.net[group, cid]
+        for side, backers in self.signal_sides(cid, by_wallet):
             key = (group, cid, side, len(backers))
             if key in self.alerted:
                 continue
             self.alerted.add(key)
             is_yes = side == self.markets[cid]["outcomes"].get(0, "Yes")
-            self.alert(group, self.markets[cid], side, backers,
+            direction = 1 if is_yes else -1
+            opposing = sum(-v * direction for v in by_wallet.values() if v * direction < 0)
+            self.alert(group, self.markets[cid], side, backers, opposing,
                        yes_price if is_yes else 1 - yes_price)
 
-    def alert(self, group, info, side, backers, price):
+    def model_view(self, group, cid, side, backers, opposing, price):
+        """Regression probability + edge for this alert (None if no model / no data)."""
+        raws = []
+        for w in backers:
+            t = self.traders.get(self.watch[w]["wallet"])
+            if not t or t.get("bets") in (None, "") or t.get("recent_expected") in (None, ""):
+                continue                     # not scored by the hourly script yet
+            settled = int(t.get("our_settled") or 0)
+            avg_return = float((t.get("our_avg_return") or "0%").rstrip("%")) / 100
+            entry = self.watch[w]
+            raws.append(ps.trader_raw(
+                {**t, "lb_rank": entry["rank"], "lb_pnl": entry["pnl"], "lb_vol": entry["vol"]},
+                (int(t.get("our_wins") or 0), settled, avg_return * settled)))
+        total = sum(backers.values())
+        raw = {**(ps.mean_raw(raws) if raws else {}),
+               "num_traders": len(backers), "total_usdc": total, "opposing_usdc": opposing,
+               **ps.market_raw(None, ps.market_state(cid), side, price=price)}
+        return ps.model_prediction(raw, group, price)
+
+    def alert(self, group, info, side, backers, opposing, price):
         order = sorted(backers, key=lambda w: -backers[w])
         names = [self.watch[w]["name"] for w in order]
+        prob, edge = self.model_view(group, info["cid"], side, backers, opposing, price)
         scores = []
         for w in order:
             t = self.traders.get(self.watch[w]["wallet"])
@@ -205,6 +250,8 @@ class Tracker:
         row = {"time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "group": group,
                "market": info["title"], "side": side, "num_traders": len(backers),
                "total_usdc": round(total, 2), "price_now": round(price, 4),
+               "model_prob": prob if prob is not None else "",
+               "model_edge": edge if edge is not None else "",
                "traders": "; ".join(f"{self.watch[w]['name']} ${backers[w]:,.0f}" for w in order),
                "trader_scores": "; ".join(scores), "url": url, "condition_id": info["cid"]}
         new_file = not os.path.exists(ALERTS)
@@ -213,10 +260,12 @@ class Tracker:
             if new_file:
                 wr.writeheader()
             wr.writerow(row)
-        log(f"ALERT {group}: {info['title']} -> {side} @ {price:.2f}, "
+        model = (f"model {prob * 100:.0f}% (edge {edge * 100:+.0f} pts)" if prob is not None
+                 else "model n/a")
+        log(f"ALERT {group}: {info['title']} -> {side} @ {price:.2f}, {model}, "
             f"{len(backers)} traders ${total:,.0f} ({', '.join(names)})")
         if NOTIFY:
-            notify(f"{len(backers)} top traders: {side} @ {price * 100:.0f}c",
+            notify(f"{len(backers)} top traders: {side} @ {price * 100:.0f}c - {model}",
                    f"{info['title']}\n{group} - ${total:,.0f} - {', '.join(names)}")
 
     # --- main loop ---------------------------------------------------------
@@ -233,6 +282,8 @@ class Tracker:
                     self.load_today(list(self.watch))
                 if time.time() - self.leaderboards_at > LEADERBOARD_REFRESH:
                     self.traders = ps.load_traders()
+                    ps._model.clear()          # pick up a refitted model_coefficients.json
+                    ps._markets.clear()        # fresh end dates / liquidity
                     self.load_today(self.load_leaderboards())
                 if payload:
                     self.on_trade(payload)

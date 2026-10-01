@@ -151,7 +151,7 @@ HISTORY = "history.csv"      # signals rebuilt for past days by backfill.py (tra
 
 DATA = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
-FIELDS = ["date", "group", "score", "first_seen", "last_updated", "market", "side",
+FIELDS = ["date", "group", "score", "model_prob", "model_edge", "first_seen", "last_updated", "market", "side",
           "num_traders", "total_usdc", "opposing_usdc", "avg_price", "entry_price",
           "current_price", "price_move", "ends", "result", "return", "traders",
           "trader_scores", "score_parts", "factor_values", "raw_values", "url",
@@ -492,6 +492,68 @@ def dump_raw(raw):
     return json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in raw.items()})
 
 
+# --- regression model (fitted by model.R) ------------------------------------
+
+MODEL_FILE = "model_coefficients.json"
+_model = []
+
+
+def load_model():
+    """The coefficients model.R saved, or None if it hasn't been run yet (cached)."""
+    if not _model:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), MODEL_FILE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                _model.append(json.load(f))
+        except (OSError, ValueError):
+            _model.append(None)
+    return _model[0]
+
+
+def model_features(raw, fills):
+    """Rebuild the variables exactly as model.R does (section 3)."""
+    def v(k, default):
+        x = raw.get(k)
+        return default if x is None else x
+    total, opposing = v("total_usdc", 0), v("opposing_usdc", 0)
+    liquidity = raw.get("liquidity_usd")
+    return {
+        "edge": v("edge_raw", 0),
+        "recent_edge": v("recent_edge_raw", 0),
+        "coin_flip_rate": v("coin_flip_rate", 0.5),
+        "win_rate": v("win_rate_raw", fills["win_rate"]),
+        "log_bets": math.log10(v("bets", 0) + 1),
+        "our_avg_return": v("our_avg_return", 0),
+        "log_our_signals": math.log10(v("our_signals", 0) + 1),
+        "num_traders": v("num_traders", 0),
+        "log_total_usd": math.log10(total) if total > 0 else 0,
+        "opposing_share": opposing / (total + opposing) if total + opposing else 0,
+        "price_move_cents": v("price_move_cents", 0),
+        "log_days_to_end": math.log10(max(v("days_to_end", 1), 0) + 0.1),
+        "has_live_data": 1 if raw.get("lb_rank") is not None else 0,
+        "lb_rank": v("lb_rank", fills["lb_rank"]),
+        "lb_roi": v("lb_roi", fills["lb_roi"]),
+        "log_liquidity": math.log10(liquidity + 1) if liquidity is not None
+        else fills["log_liquidity"],
+    }
+
+
+def model_prediction(raw, group, price):
+    """(win probability, edge = probability - price) from the regression, or (None, None)."""
+    model = load_model()
+    if not model or price is None or not raw:
+        return None, None
+    coefs = model["coefficients"]
+    x = model_features(raw, model["fills"])
+    z = model["intercept"] + coefs.get(f"group{group}", 0)
+    z += sum(coefs.get(k, 0) * val for k, val in x.items())
+    z += coefs.get(f"group{group}:num_traders", 0) * x["num_traders"]   # agreement x group
+    p = clamp(price, 0.02, 0.98)
+    z += math.log(p / (1 - p))                  # offset: the market's own odds
+    prob = 1 / (1 + math.exp(-z))
+    return round(prob, 4), round(prob - price, 4)
+
+
 def format_parts(group, parts):
     weights = WEIGHTS[group]
     return "; ".join(f"{k} {100 * weights[k] * parts[k]:.1f}" for k in weights if k in parts)
@@ -585,6 +647,8 @@ def update_prices(rows):
             # market measurements at the moment we'd have bet (first seen), kept from then on
             raw.update(market_raw(avg, state, r["side"], price=entry))
             r["raw_values"] = dump_raw(raw)
+        # regression's view at today's price: probability and edge over buying now
+        r["model_prob"], r["model_edge"] = model_prediction(raw, r["group"], price)
         group = r["group"]
         parts = factor_values(r)
         if not parts:
