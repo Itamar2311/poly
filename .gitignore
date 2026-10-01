@@ -13,3 +13,6 @@ traders.csv
 trader_stats.json
 run_log.txt
 politics_top25_*.csv
+weights.json
+alerts.csv
+live_log.txt

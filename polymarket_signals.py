@@ -18,6 +18,10 @@ PROFILES (weights, which market end dates are best, what counts as liquid / a bi
 over the traders behind the signal; market factors are refreshed on every run.
 The "score_parts" column shows how many points each factor gave.
 
+The weights tune themselves: once MIN_SETTLED signals have settled, every run shifts
+weight toward factors that went with profitable signals (see learn_weights and
+weights.json), always keeping each factor between 1% and 10% of the score.
+
 All signals go into signals.csv, highest score first. Running again updates open
 signals (current price, score) and fills in result + return once a market settles.
 Every trader who has appeared in a signal is kept in traders.csv.
@@ -116,6 +120,19 @@ for _g, _p in PROFILES.items():
     assert max(_w.values()) <= 0.10, f"{_g}: no factor may be worth more than 10% of the score"
     assert abs(sum(_w.values()) - 1) < 1e-9, f"{_g}: weights add up to {sum(_w.values()):.2f}, not 1"
 assert set(PROFILES) == set(GROUPS), "every group needs a scoring profile"
+# self-tuning: once enough signals have settled, each run shifts weight toward the
+# factors that went with profitable signals (and away from those that didn't).
+# Weights are recalculated from all settled data every run, starting from the
+# PROFILES defaults, so they move gradually as data builds up.
+MIN_SETTLED = 20             # settled signals needed before weights start to move
+CONFIDENCE_N = 50            # at this many settled signals the shift is half its maximum
+MAX_MULTIPLIER = 3.0         # a factor's weight can grow to at most 3x its default ...
+MIN_MULTIPLIER = 0.25        # ... or shrink to 1/4 (always within 1%-10% of the score)
+WEIGHT_FLOOR = 0.01
+WEIGHT_CAP = 0.10
+RETURN_CLIP = 3.0            # cap a single signal's return at +300% so one long shot can't steer
+WEIGHTS_FILE = "weights.json"   # the weights currently in use, per group
+
 TRADER_FACTORS = ["edge", "recent_edge", "coin_flip", "our_record", "win_rate",
                   "experience", "lb_rank", "lb_roi"]
 MARKET_FACTORS = ["price", "timing", "liquidity"]   # refreshed every run
@@ -136,7 +153,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 FIELDS = ["date", "group", "score", "first_seen", "last_updated", "market", "side",
           "num_traders", "total_usdc", "opposing_usdc", "avg_price", "entry_price",
           "current_price", "price_move", "ends", "result", "return", "traders",
-          "trader_scores", "score_parts", "url", "condition_id", "wallets"]
+          "trader_scores", "score_parts", "factor_values", "url", "condition_id", "wallets"]
 TRADER_FIELDS = ["name", "score", "groups", "num_signals", "our_wins", "our_settled",
                  "our_avg_return", "edge", "recent_edge", "wins", "expected_wins", "bets",
                  "recent_wins", "recent_expected", "recent_bets", "cf_wins", "cf_bets",
@@ -295,9 +312,91 @@ def trader_parts(t, record):
     }
 
 
+WEIGHTS = {g: dict(p["weights"]) for g, p in PROFILES.items()}   # replaced by learn_weights()
+
+
+def capped_normalize(raw, lo=WEIGHT_FLOOR, hi=WEIGHT_CAP):
+    """Scale weights to add up to 1 while keeping each between lo and hi."""
+    fixed = {}
+    while True:
+        free = {k: v for k, v in raw.items() if k not in fixed}
+        if not free:
+            return fixed
+        remaining = 1 - sum(fixed.values())
+        total = sum(free.values()) or 1
+        scaled = {k: remaining * v / total for k, v in free.items()}
+        out_of_range = {k: hi if v > hi else lo for k, v in scaled.items() if not lo <= v <= hi}
+        if not out_of_range:
+            merged = {**fixed, **scaled}
+            return {k: merged[k] for k in raw}
+        fixed.update(out_of_range)
+
+
+def correlation(xs, ys):
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    sy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    if sx == 0 or sy == 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (sx * sy)
+
+
+def learn_weights(rows):
+    """Set WEIGHTS from settled signals; returns a one-line summary for the log."""
+    settled = defaultdict(list)    # group -> [(factor values, outcome)]
+    for r in rows.values():
+        if r.get("result") in ("won", "lost") and r.get("return") not in (None, ""):
+            values = factor_values(r)
+            if values:
+                settled[r["group"]].append((values, min(float(r["return"]), RETURN_CLIP)))
+    everything = [x for xs in settled.values() for x in xs]
+
+    report, summary = {}, []
+    for group, profile in PROFILES.items():
+        data = settled[group] if len(settled[group]) >= MIN_SETTLED else everything
+        defaults = profile["weights"]
+        if len(data) < MIN_SETTLED:
+            WEIGHTS[group] = dict(defaults)
+            report[group] = {"source": f"defaults (need {MIN_SETTLED} settled, have {len(data)})",
+                             "weights": WEIGHTS[group]}
+            continue
+        n = len(data)
+        confidence = n / (n + CONFIDENCE_N)
+        outcomes = [o for _, o in data]
+        raw, corr = {}, {}
+        for k, default in defaults.items():
+            xs = [v.get(k, 0.5) for v, _ in data]
+            c = corr[k] = correlation(xs, outcomes)
+            # t-statistic: how sure we are the link is real and not noise (about 2 = fairly sure).
+            # No evidence (t ~ 0) shrinks a factor a little, real evidence (t > 1) grows it,
+            # a factor that goes with losing (t < 0) shrinks fast.
+            t = c * math.sqrt(max(n - 2, 1)) / math.sqrt(max(1 - c * c, 1e-9))
+            raw[k] = default * clamp(1 + 0.5 * confidence * (t - 1), MIN_MULTIPLIER, MAX_MULTIPLIER)
+        WEIGHTS[group] = capped_normalize(raw)
+        source = "own" if data is settled[group] else "all groups"
+        report[group] = {"source": f"learned from {n} settled signals ({source})",
+                         "weights": {k: round(v, 4) for k, v in WEIGHTS[group].items()},
+                         "correlation_with_return": {k: round(v, 3) for k, v in corr.items()}}
+        top = max(WEIGHTS[group], key=lambda k: WEIGHTS[group][k] / defaults[k])
+        summary.append(f"{group}: {n} settled, +{top}")
+
+    with open(WEIGHTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=1)
+    return "weights: " + ("; ".join(summary) if summary else
+                          f"defaults (need {MIN_SETTLED} settled signals, have {len(everything)})")
+
+
+def factor_values(r):
+    """{factor: 0-1} for a signals.csv row."""
+    if r.get("factor_values"):
+        return json.loads(r["factor_values"])
+    return parse_parts(r["group"], r.get("score_parts"))   # rows from before factor_values
+
+
 def trader_score(t, record, group="OVERALL"):
     """0-100 score for one trader, from the trader factors only (group's weights)."""
-    weights = PROFILES[group]["weights"]
+    weights = WEIGHTS[group]
     parts = trader_parts(t, record)
     return 100 * sum(weights[k] * v for k, v in parts.items()) / sum(weights[k] for k in parts)
 
@@ -328,7 +427,7 @@ def market_parts(group, avg_price, state, side):
 
 
 def format_parts(group, parts):
-    weights = PROFILES[group]["weights"]
+    weights = WEIGHTS[group]
     return "; ".join(f"{k} {100 * weights[k] * parts[k]:.1f}" for k in weights if k in parts)
 
 
@@ -416,13 +515,19 @@ def update_prices(rows):
         r["price_move"] = round(price - avg, 4)
         r["ends"] = (state["end"] or "")[:10]
         group = r["group"]
-        parts = parse_parts(group, r.get("score_parts"))
+        parts = factor_values(r)
         if not parts:
             continue                           # row from an older version of the script
         parts.update(market_parts(group, avg, state, r["side"]))
-        weights = PROFILES[group]["weights"]
-        r["score_parts"] = format_parts(group, parts)
-        r["score"] = round(100 * sum(weights[k] * v for k, v in parts.items()), 1)
+        set_score(r, group, parts)
+
+
+def set_score(r, group, parts):
+    """Write factor values, points per factor and total score into a row."""
+    weights = WEIGHTS[group]
+    r["factor_values"] = json.dumps({k: round(v, 4) for k, v in parts.items()})
+    r["score_parts"] = format_parts(group, parts)
+    r["score"] = round(100 * sum(weights[k] * v for k, v in parts.items() if k in weights), 1)
 
 
 def our_records(rows):
@@ -453,6 +558,7 @@ def main():
             rows = {(r["date"], r["group"], r["condition_id"], r["side"]): r
                     for r in csv.DictReader(f)}
     update_prices(rows)            # settle finished markets first so records are current
+    learned = learn_weights(rows)
     records = our_records(rows)
     traders = load_traders()
 
@@ -499,7 +605,7 @@ def main():
                 f" over {traders[w]['bets']} bets, "
                 f"50/50 {traders[w]['cf_wins']}/{traders[w]['cf_bets']}, "
                 f"ours {records[w][0]}/{records[w][1]})" for w in order),
-            "score_parts": format_parts(group, parts),   # market factors added by update_prices
+            "factor_values": json.dumps({k: round(v, 4) for k, v in parts.items()}),
             "url": f"https://polymarket.com/event/{m['slug']}",
             "condition_id": cid,
             "wallets": ";".join(order),
@@ -541,7 +647,7 @@ def main():
         w.writerows(sorted((traders[w] for w in seen), key=lambda t: -t["score"]))
 
     log(f"{stamp}: {len(found)} signals today -> {OUTPUT} ({len(rows)} total), "
-        f"{len(seen)} traders -> {TRADERS}")
+        f"{len(seen)} traders -> {TRADERS}; {learned}")
 
 
 def log(msg):
