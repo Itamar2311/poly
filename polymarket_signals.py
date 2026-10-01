@@ -146,6 +146,7 @@ EDGE_SCALE = 2               # edge of +25% (wins 25 points above implied) -> fu
 OUTPUT = "signals.csv"       # every signal, highest score first
 LOG = "run_log.txt"          # one line per run, plus any errors
 TRADERS = "traders.csv"      # every trader who has appeared in a signal (stats refreshed daily)
+HISTORY = "history.csv"      # signals rebuilt for past days by backfill.py (training data)
 # --------------------------------------------------------------------------
 
 DATA = "https://data-api.polymarket.com"
@@ -153,7 +154,9 @@ GAMMA = "https://gamma-api.polymarket.com"
 FIELDS = ["date", "group", "score", "first_seen", "last_updated", "market", "side",
           "num_traders", "total_usdc", "opposing_usdc", "avg_price", "entry_price",
           "current_price", "price_move", "ends", "result", "return", "traders",
-          "trader_scores", "score_parts", "factor_values", "url", "condition_id", "wallets"]
+          "trader_scores", "score_parts", "factor_values", "raw_values", "url",
+          "condition_id", "wallets"]
+HISTORY_FIELDS = FIELDS + ["lookahead"]
 TRADER_FIELDS = ["name", "score", "groups", "num_signals", "our_wins", "our_settled",
                  "our_avg_return", "edge", "recent_edge", "wins", "expected_wins", "bets",
                  "recent_wins", "recent_expected", "recent_bets", "cf_wins", "cf_bets",
@@ -163,15 +166,21 @@ INT_FIELDS = {"wins", "bets", "cf_wins", "cf_bets", "recent_wins", "recent_bets"
 FLOAT_FIELDS = {"expected_wins", "recent_expected", "lb_rank", "lb_pnl", "lb_vol"}
 
 
+MIN_REQUEST_GAP = 0.1         # seconds between API calls, to stay under Polymarket's rate limit
+_last_request = [0.0]
+
+
 def get(base, path, **params):
     url = f"{base}{path}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    for attempt in range(5):
+    for attempt in range(6):
+        time.sleep(max(0.0, MIN_REQUEST_GAP - (time.time() - _last_request[0])))
+        _last_request[0] = time.time()
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)
         except Exception:
-            if attempt == 4:
+            if attempt == 5:
                 raise
             time.sleep(2 ** attempt)
 
@@ -191,8 +200,8 @@ def trades_today(wallet, start_ts):
             batch = get(DATA, "/activity", user=wallet, type="TRADE", start=start_ts,
                         limit=500, offset=offset)
             out += [t for t in batch if t["timestamp"] >= start_ts]
-            if len(batch) < 500:
-                break
+            if len(batch) < 500 or len(out) > MAX_TRADES_PER_DAY:
+                break      # over the bot limit: no need for the rest (API stops at 5000)
             offset += 500
         _trades[wallet] = out
     return _trades[wallet]
@@ -230,16 +239,16 @@ def market_state(cid):
 
 # --- trader history -------------------------------------------------------
 
-def settled_bets(wallet):
-    """[(entry_price, won, settled_ts)] for the wallet's settled bets in the last LOOKBACK_DAYS.
+def settled_bets(wallet, days=LOOKBACK_DAYS, max_pages=40):
+    """[(entry_price, won, settled_ts)] for the wallet's settled bets in the last `days`.
 
     Polymarket keeps winning / sold bets in closed-positions, but losing bets that were
     never cashed out stay in positions (redeemable, price 0), so both are needed.
     """
-    cutoff = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).timestamp()
+    cutoff = (datetime.now() - timedelta(days=days)).timestamp()
     bets = []
 
-    for page in range(40):   # closed-positions: 50 per page, newest first
+    for page in range(max_pages):   # closed-positions: 50 per page, newest first
         batch = get(DATA, "/closed-positions", user=wallet, limit=50, offset=page * 50,
                     sortBy="TIMESTAMP", sortDirection="DESC")
         bets += [(p["avgPrice"], p["realizedPnl"] > 0, p["timestamp"]) for p in batch
@@ -253,8 +262,8 @@ def settled_bets(wallet):
         for p in batch:
             try:
                 ts = datetime.strptime(p["endDate"][:10], "%Y-%m-%d").timestamp()
-            except (KeyError, TypeError, ValueError):
-                continue
+            except (KeyError, TypeError, ValueError, OSError, OverflowError):
+                continue                    # missing or nonsense end date (e.g. year 0)
             if ts >= cutoff:
                 bets.append((p["avgPrice"], p["curPrice"] >= 0.99, ts))
         if len(batch) < 500:
@@ -362,18 +371,21 @@ def learn_weights(rows):
                              "weights": WEIGHTS[group]}
             continue
         n = len(data)
-        confidence = n / (n + CONFIDENCE_N)
-        outcomes = [o for _, o in data]
-        raw, corr = {}, {}
-        for k, default in defaults.items():
-            xs = [v.get(k, 0.5) for v, _ in data]
-            c = corr[k] = correlation(xs, outcomes)
+        mult, corr = {}, {}
+        for k in defaults:
+            known = [(v[k], o) for v, o in data if k in v]   # history lacks some factors
+            if len(known) < MIN_SETTLED:
+                continue
+            c = corr[k] = correlation([x for x, _ in known], [o for _, o in known])
+            confidence = len(known) / (len(known) + CONFIDENCE_N)
             # t-statistic: how sure we are the link is real and not noise (about 2 = fairly sure).
             # No evidence (t ~ 0) shrinks a factor a little, real evidence (t > 1) grows it,
             # a factor that goes with losing (t < 0) shrinks fast.
-            t = c * math.sqrt(max(n - 2, 1)) / math.sqrt(max(1 - c * c, 1e-9))
-            raw[k] = default * clamp(1 + 0.5 * confidence * (t - 1), MIN_MULTIPLIER, MAX_MULTIPLIER)
-        WEIGHTS[group] = capped_normalize(raw)
+            t = c * math.sqrt(max(len(known) - 2, 1)) / math.sqrt(max(1 - c * c, 1e-9))
+            mult[k] = clamp(1 + 0.5 * confidence * (t - 1), MIN_MULTIPLIER, MAX_MULTIPLIER)
+        # factors without enough data stay neutral: they move with the average, not against it
+        neutral = sum(mult.values()) / len(mult) if mult else 1.0
+        WEIGHTS[group] = capped_normalize({k: d * mult.get(k, neutral) for k, d in defaults.items()})
         source = "own" if data is settled[group] else "all groups"
         report[group] = {"source": f"learned from {n} settled signals ({source})",
                          "weights": {k: round(v, 4) for k, v in WEIGHTS[group].items()},
@@ -406,24 +418,78 @@ def log_scale(x, lo, hi):
     return clamp(math.log10(max(x, 1e-9) / lo) / math.log10(hi / lo))
 
 
+def days_until_end(state, from_ts=None):
+    """Days from now (or from_ts) until the market's end date; None if unknown."""
+    try:
+        end = datetime.fromisoformat(state["end"].replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return (end - (from_ts if from_ts is not None else time.time())) / 86400
+
+
+def timing_part(group, days):
+    if days is None:
+        return 0.5
+    return next(v for max_days, v in PROFILES[group]["timing"] if days <= max_days)
+
+
 def market_parts(group, avg_price, state, side):
     """Factors that change while the market is open, each 0-1."""
     profile = PROFILES[group]
     price = state["prices"].get(side)
     move = price - avg_price if price is not None and avg_price else 0
-    timing = 0.5
-    if state["end"]:
-        try:
-            end = datetime.fromisoformat(state["end"].replace("Z", "+00:00"))
-            days = (end - datetime.now(timezone.utc)).total_seconds() / 86400
-            timing = next(v for max_days, v in profile["timing"] if days <= max_days)
-        except ValueError:
-            pass
     return {
         "price": clamp(0.5 - move * 100 / 40),                        # +-20c -> 0 / 1
-        "timing": timing,
+        "timing": timing_part(group, days_until_end(state)),
         "liquidity": log_scale(state["liquidity"], *profile["liquidity"]),
     }
+
+
+# --- raw values (unsquashed measurements, for the regression in model.R) ----
+
+def ratio(a, b):
+    return a / b if b else None
+
+
+def trader_raw(t, record):
+    """One trader's raw measurements. None = unknown."""
+    _, settled, total_return = record
+    vol = t.get("lb_vol")
+    return {
+        "edge_raw": ratio(t["wins"] - t["expected_wins"], t["bets"]),
+        "recent_edge_raw": ratio(t["recent_wins"] - t["recent_expected"], t["recent_bets"]),
+        "coin_flip_rate": ratio(t["cf_wins"], t["cf_bets"]),
+        "win_rate_raw": ratio(t["wins"], t["bets"]),
+        "bets": t["bets"],
+        "cf_bets": t["cf_bets"],
+        "our_signals": settled,
+        "our_avg_return": ratio(total_return, settled),
+        "lb_rank": t.get("lb_rank") if t.get("lb_rank") not in (None, "") else None,
+        "lb_roi": ratio(t.get("lb_pnl") or 0, vol) if vol not in (None, "") else None,
+    }
+
+
+def mean_raw(raws):
+    """Average each measurement over the traders behind a signal (ignoring unknowns)."""
+    out = {}
+    for k in raws[0]:
+        known = [r[k] for r in raws if r[k] is not None]
+        out[k] = sum(known) / len(known) if known else None
+    return out
+
+
+def market_raw(avg_price, state, side, from_ts=None, price=None):
+    price = state["prices"].get(side) if price is None else price
+    return {
+        "price_move_cents": round((price - avg_price) * 100, 2)
+        if price is not None and avg_price else None,
+        "days_to_end": days_until_end(state, from_ts),
+        "liquidity_usd": state["liquidity"] if from_ts is None else None,
+    }
+
+
+def dump_raw(raw):
+    return json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in raw.items()})
 
 
 def format_parts(group, parts):
@@ -514,6 +580,11 @@ def update_prices(rows):
         r["current_price"] = price
         r["price_move"] = round(price - avg, 4)
         r["ends"] = (state["end"] or "")[:10]
+        raw = json.loads(r["raw_values"]) if r.get("raw_values") else None
+        if raw is not None and "price_move_cents" not in raw:
+            # market measurements at the moment we'd have bet (first seen), kept from then on
+            raw.update(market_raw(avg, state, r["side"], price=entry))
+            r["raw_values"] = dump_raw(raw)
         group = r["group"]
         parts = factor_values(r)
         if not parts:
@@ -523,11 +594,12 @@ def update_prices(rows):
 
 
 def set_score(r, group, parts):
-    """Write factor values, points per factor and total score into a row."""
+    """Write factor values, points per factor and total score into a row.
+    Factors missing from `parts` (unknown, e.g. in backfilled history) count as 0.5."""
     weights = WEIGHTS[group]
     r["factor_values"] = json.dumps({k: round(v, 4) for k, v in parts.items()})
     r["score_parts"] = format_parts(group, parts)
-    r["score"] = round(100 * sum(weights[k] * v for k, v in parts.items() if k in weights), 1)
+    r["score"] = round(100 * sum(w * parts.get(k, 0.5) for k, w in weights.items()), 1)
 
 
 def our_records(rows):
@@ -542,6 +614,22 @@ def our_records(rows):
     return defaultdict(lambda: (0, 0, 0.0), {w: tuple(v) for w, v in rec.items()})
 
 
+def load_rows(path):
+    """{(date, group, condition_id, side): row} from a signals-style csv."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, newline="", encoding="utf-8") as f:
+        return {(r["date"], r["group"], r["condition_id"], r["side"]): r
+                for r in csv.DictReader(f)}
+
+
+def save_history(history):
+    with open(HISTORY, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorted(history.values(), key=lambda r: (r["date"], r["group"])))
+
+
 def edge_text(wins, expected, bets):
     return f"{(wins - expected) / bets:+.1%}" if bets else ""
 
@@ -552,14 +640,11 @@ def main():
     start_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     date, stamp = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M")
 
-    rows = {}
-    if os.path.exists(OUTPUT):
-        with open(OUTPUT, newline="", encoding="utf-8") as f:
-            rows = {(r["date"], r["group"], r["condition_id"], r["side"]): r
-                    for r in csv.DictReader(f)}
+    rows, history = load_rows(OUTPUT), load_rows(HISTORY)
     update_prices(rows)            # settle finished markets first so records are current
-    learned = learn_weights(rows)
-    records = our_records(rows)
+    update_prices(history)
+    learned = learn_weights({**history, **rows})   # learn from backfilled + live signals
+    records = our_records({**history, **rows})
     traders = load_traders()
 
     names, leaderboard = {}, {}
@@ -584,6 +669,12 @@ def main():
         order = sorted(backers, key=lambda w: -backers[w])
         key = (date, group, cid, side)
         old = rows.get(key, {})
+        raw = {**mean_raw([trader_raw(traders[w], records[w]) for w in backers]),
+               "num_traders": len(backers), "total_usdc": round(total, 2),
+               "opposing_usdc": round(opposing, 2)}
+        if old.get("raw_values"):      # keep market measurements taken when first seen
+            raw.update({k: v for k, v in json.loads(old["raw_values"]).items()
+                        if k in ("price_move_cents", "days_to_end", "liquidity_usd")})
         rows[key] = {
             "date": date,
             "group": group,
@@ -606,6 +697,7 @@ def main():
                 f"50/50 {traders[w]['cf_wins']}/{traders[w]['cf_bets']}, "
                 f"ours {records[w][0]}/{records[w][1]})" for w in order),
             "factor_values": json.dumps({k: round(v, 4) for k, v in parts.items()}),
+            "raw_values": dump_raw(raw),
             "url": f"https://polymarket.com/event/{m['slug']}",
             "condition_id": cid,
             "wallets": ";".join(order),
@@ -617,6 +709,8 @@ def main():
         w.writeheader()
         newest_first = sorted(rows.values(), key=lambda r: r["last_updated"], reverse=True)
         w.writerows(sorted(newest_first, key=lambda r: -float(r.get("score") or 0)))
+    if history:
+        save_history(history)
 
     # every trader who appears in any signal, with their latest stats and score
     seen = defaultdict(lambda: {"groups": set(), "dates": [], "n": 0})

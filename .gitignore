@@ -16,3 +16,11 @@ politics_top25_*.csv
 weights.json
 alerts.csv
 live_log.txt
+history.csv
+backfill_cache.json
+backfill_cache.json.tmp
+backfill_log.txt
+model_coefficients.json
+plots/
+.Rhistory
+.RData
