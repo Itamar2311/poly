@@ -413,6 +413,13 @@ def trader_score(t, record, group="OVERALL"):
     return 100 * sum(weights[k] * v for k, v in parts.items()) / sum(weights[k] for k in parts)
 
 
+AGREEMENT_RATING = {1: 0.0, 2: 0.5, 3: 0.8}   # 4+ traders = 1.0 (was 0.33 / 0.67 for 2 / 3)
+
+
+def agreement_part(num_traders):
+    return AGREEMENT_RATING.get(num_traders, 1.0)
+
+
 def log_scale(x, lo, hi):
     """0 at lo, 1 at hi, logarithmic in between."""
     return clamp(math.log10(max(x, 1e-9) / lo) / math.log10(hi / lo))
@@ -526,7 +533,8 @@ def model_features(raw, fills):
         "our_avg_return": v("our_avg_return", 0),
         "log_our_signals": math.log10(v("our_signals", 0) + 1),
         "num_traders": v("num_traders", 0),
-        "log_total_usd": math.log10(total) if total > 0 else 0,
+        "two_plus": 1 if v("num_traders", 0) >= 2 else 0,
+        "log_total_usd": math.log10(max(total, 1)),
         "opposing_share": opposing / (total + opposing) if total + opposing else 0,
         "price_move_cents": v("price_move_cents", 0),
         "log_days_to_end": math.log10(max(v("days_to_end", 1), 0) + 0.1),
@@ -571,10 +579,12 @@ def parse_parts(group, text):
 
 # --- signals --------------------------------------------------------------
 
-def find_signals(group, allowed_tags, start_ts, names, leaderboard):
+def find_signals(group, allowed_tags, start_ts, names, leaderboard, members=None):
     """Return [(market, cid, outcome_index, {wallet: usdc}, avg_price, opposing_usdc)]."""
     traders = get(DATA, "/v1/leaderboard", category=group, timePeriod="MONTH",
                   orderBy="PNL", limit=TOP_N)
+    if members is not None:
+        members[group] = [t["proxyWallet"] for t in traders]
     for t in traders:
         w = t["proxyWallet"]
         names[w] = t.get("userName") or w[:10]
@@ -618,6 +628,109 @@ def find_signals(group, allowed_tags, start_ts, names, leaderboard):
                 s = sum(shares[cid, w, direction] for w in backers)
                 signals.append((markets[cid], cid, idx, backers, c / s if s else None, opposing))
     return signals
+
+
+# --- training snapshots (every top-trader position, for the regression) -------
+#
+# Each time one more top trader of a group crosses MIN_USDC_PER_TRADER on the same side
+# of a market, we take a snapshot: how many agree (1, 2, 3...), the price at that
+# moment and the raw measurements. One trader alone is a 1-trader row, so the model
+# can learn what each extra trader adds. backfill.py and the hourly run both build
+# these rows with replay_day(), so past and live data are made the same way.
+
+TRAINING = "training.csv"
+TRAINING_FIELDS = ["date", "group", "snapshot_time", "market", "side", "num_traders",
+                   "entry_price", "avg_price", "total_usdc", "opposing_usdc", "result",
+                   "return", "raw_values", "condition_id", "wallets", "source", "lookahead"]
+
+
+def replay_day(trades, allowed_tags):
+    """trades: [(ts, wallet, cid, outcome_idx, side, price, size, title, outcome, slug)],
+    oldest first, from non-bot traders of one group. Returns snapshots."""
+    net = defaultdict(lambda: defaultdict(float))
+    cost, shares, level, markets, snaps = defaultdict(float), defaultdict(float), {}, {}, []
+    for ts, w, cid, idx, side, price, size, title, outcome, slug in trades:
+        if price >= EXTREME_ODDS or price <= 1 - EXTREME_ODDS:
+            continue
+        if not market_tags(slug) & allowed_tags:
+            continue
+        sign = 1 if (side == "BUY") == (idx == 0) else -1
+        side_price = price if side == "BUY" else 1 - price
+        net[cid][w] += sign * price * size
+        cost[cid, w, sign] += side_price * size
+        shares[cid, w, sign] += size
+        m = markets.setdefault(cid, {"title": title, "slug": slug, "outcomes": {}})
+        m["outcomes"][idx] = outcome
+        backers = {x: v * sign for x, v in net[cid].items() if v * sign >= MIN_USDC_PER_TRADER}
+        if len(backers) > level.get((cid, sign), 0):     # one more trader on this side
+            level[cid, sign] = len(backers)
+            c = sum(cost[cid, x, sign] for x in backers)
+            s = sum(shares[cid, x, sign] for x in backers)
+            snaps.append({"ts": ts, "cid": cid, "idx": 0 if sign == 1 else 1, "market": m,
+                          "backers": dict(backers), "entry": side_price,
+                          "avg": c / s if s else side_price,
+                          "opposing": sum(-v * sign for v in net[cid].values() if v * sign < 0)})
+    return snaps
+
+
+def training_rows(snaps, group, stats_of, records, names, live, lookahead=False):
+    """Turn snapshots into training.csv rows. stats_of(wallet) -> trader stats or None."""
+    rows = []
+    for s in snaps:
+        state = market_state(s["cid"])
+        names_list = list(state["prices"]) or ["Yes", "No"]
+        side = s["market"]["outcomes"].get(s["idx"]) or names_list[s["idx"]]
+        raws = [trader_raw(t, records[w]) for w in s["backers"]
+                if (t := stats_of(w)) is not None]
+        total = sum(s["backers"].values())
+        raw = {**(mean_raw(raws) if raws else {}), "num_traders": len(s["backers"]),
+               "total_usdc": round(total, 2), "opposing_usdc": round(s["opposing"], 2),
+               **market_raw(s["avg"], state, side, from_ts=s["ts"], price=s["entry"])}
+        if live:
+            raw["liquidity_usd"] = state["liquidity"]
+        order = sorted(s["backers"], key=lambda w: -s["backers"][w])
+        rows.append({
+            "date": datetime.fromtimestamp(s["ts"]).strftime("%Y-%m-%d"), "group": group,
+            "snapshot_time": datetime.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M:%S"),
+            "market": s["market"]["title"], "side": side, "num_traders": len(s["backers"]),
+            "entry_price": round(s["entry"], 4), "avg_price": round(s["avg"], 4),
+            "total_usdc": round(total, 2), "opposing_usdc": round(s["opposing"], 2),
+            "result": "", "return": "", "raw_values": dump_raw(raw),
+            "condition_id": s["cid"], "wallets": ";".join(order),
+            "source": "live" if live else "backfill", "lookahead": lookahead,
+        })
+    settle(rows)
+    return rows
+
+
+def settle(rows):
+    """Fill result + return for rows whose market has ended (training.csv rows)."""
+    for r in rows:
+        if r.get("result"):
+            continue
+        state = market_state(r["condition_id"])
+        price = state["prices"].get(r["side"])
+        if state["closed"] and price is not None:
+            won = price >= 0.99
+            entry = float(r["entry_price"])
+            r["result"] = "won" if won else "lost"
+            r["return"] = round((1 - entry) / entry if won else -1.0, 4)
+
+
+def load_training():
+    if not os.path.exists(TRAINING):
+        return []
+    with open(TRAINING, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def save_training(rows):
+    tmp = TRAINING + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=TRAINING_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorted(rows, key=lambda r: (r["date"], r["snapshot_time"])))
+    os.replace(tmp, TRAINING)
 
 
 def update_prices(rows):
@@ -711,13 +824,30 @@ def main():
     records = our_records({**history, **rows})
     traders = load_traders()
 
-    names, leaderboard = {}, {}
+    names, leaderboard, members = {}, {}, {}
     found = [(group, *s) for group, tags in GROUPS.items()
-             for s in find_signals(group, tags, start_ts, names, leaderboard)]
-    refresh_stats(traders, {w for _, _, _, _, backers, _, _ in found for w in backers})
+             for s in find_signals(group, tags, start_ts, names, leaderboard, members)]
+
+    # training snapshots: every top-trader position today (1, 2, 3... traders)
+    snaps = {}
+    for group, wallets in members.items():
+        trades = [(t["timestamp"], w, t["conditionId"], t["outcomeIndex"], t["side"],
+                   t["price"], t["size"], t["title"], t["outcome"], t["eventSlug"])
+                  for w in wallets if len(_trades.get(w, [])) <= MAX_TRADES_PER_DAY
+                  for t in _trades.get(w, [])]
+        snaps[group] = replay_day(sorted(trades, key=lambda x: x[0]), GROUPS[group])
+
+    refresh_stats(traders, {w for _, _, _, _, backers, _, _ in found for w in backers}
+                  | {w for ss in snaps.values() for s in ss for w in s["backers"]})
     for w, (rank, pnl, vol) in leaderboard.items():
         if w in traders:
             traders[w].update(lb_rank=rank, lb_pnl=round(pnl, 2), lb_vol=round(vol, 2))
+
+    today_rows = [r for group, ss in snaps.items()
+                  for r in training_rows(ss, group, traders.get, records, names, live=True)]
+    training = [r for r in load_training() if not (r["source"] == "live" and r["date"] == date)]
+    settle(training)               # past snapshots whose markets have ended since
+    save_training(training + today_rows)
 
     for group, m, cid, idx, backers, avg_price, opposing in found:
         side = m["outcomes"].get(idx, "Yes" if idx == 0 else "No")
@@ -726,7 +856,7 @@ def main():
         parts = {k: sum(p[k] for p in per_trader.values()) / len(per_trader)
                  for k in TRADER_FACTORS}
         parts.update(
-            agreement=clamp((len(backers) - 1) / 3),                         # 2/3/4+ traders
+            agreement=agreement_part(len(backers)),
             conviction=log_scale(total, *PROFILES[group]["conviction"]),
             consensus=total / (total + opposing),
         )
@@ -784,8 +914,10 @@ def main():
             seen[w]["dates"].append(r["date"])
             seen[w]["n"] += 1
     refresh_stats(traders, seen)   # only fetches traders not refreshed today
-    for w, info in seen.items():
-        t = traders[w]
+    for w, t in traders.items():   # every trader we have stats for (signals + snapshots)
+        if t.get("bets") in (None, ""):
+            continue
+        info = seen.get(w, {"groups": set(), "dates": [], "n": 0})
         wins, settled, total_return = records[w]
         old_groups = set(filter(None, (t.get("groups") or "").split(", ")))
         t.update(
@@ -796,16 +928,39 @@ def main():
             our_avg_return=f"{total_return / settled:+.0%}" if settled else "",
             edge=edge_text(t["wins"], t["expected_wins"], t["bets"]),
             recent_edge=edge_text(t["recent_wins"], t["recent_expected"], t["recent_bets"]),
-            first_seen=min(info["dates"]), last_seen=max(info["dates"]),
+            first_seen=min(info["dates"]) if info["dates"] else t.get("first_seen", ""),
+            last_seen=max(info["dates"]) if info["dates"] else t.get("last_seen", ""),
             score=round(trader_score(t, records[w])),
         )
+    kept = [t for t in traders.values() if t.get("bets") not in (None, "")]
     with open(TRADERS, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=TRADER_FIELDS, extrasaction="ignore")
         w.writeheader()
-        w.writerows(sorted((traders[w] for w in seen), key=lambda t: -t["score"]))
+        w.writerows(sorted(kept, key=lambda t: (-int(t["num_signals"] or 0), -t["score"])))
+
+    import paper_trading           # approve by rule, imaginary $1 bets, track + exit
+    paper = paper_trading.run(snaps, traders, records, names)
 
     log(f"{stamp}: {len(found)} signals today -> {OUTPUT} ({len(rows)} total), "
-        f"{len(seen)} traders -> {TRADERS}; {learned}")
+        f"{len(today_rows)} training snapshots today, {len(kept)} traders -> {TRADERS}; "
+        f"{learned}; {paper}")
+
+
+def notify(title, body):
+    """Windows toast notification via PowerShell (no extra packages needed)."""
+    import subprocess
+    from xml.sax.saxutils import escape
+    xml = (f"<toast><visual><binding template='ToastGeneric'><text>{escape(title)}</text>"
+           f"<text>{escape(body)}</text></binding></visual></toast>").replace("'", "''")
+    script = (
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+        "$x = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]::new();"
+        f"$x.LoadXml('{xml}');"
+        "$id = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id)"
+        ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", script],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def log(msg):

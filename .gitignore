@@ -21,6 +21,12 @@ backfill_cache.json
 backfill_cache.json.tmp
 backfill_log.txt
 model_coefficients.json
+model_log.txt
+training.csv
+paper_trades.csv
+paper_trades.json
+candidates.csv
+*.tmp
 plots/
 .Rhistory
 .RData

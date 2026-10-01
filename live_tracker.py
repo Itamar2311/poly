@@ -18,12 +18,10 @@ import csv
 import json
 import os
 import queue
-import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from xml.sax.saxutils import escape
 
 import websocket   # pip install websocket-client
 
@@ -45,19 +43,7 @@ def log(msg):
         f.write(line + "\n")
 
 
-def notify(title, body):
-    """Windows toast notification via PowerShell (no extra packages needed)."""
-    xml = (f"<toast><visual><binding template='ToastGeneric'><text>{escape(title)}</text>"
-           f"<text>{escape(body)}</text></binding></visual></toast>").replace("'", "''")
-    script = (
-        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
-        "$x = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]::new();"
-        f"$x.LoadXml('{xml}');"
-        "$id = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id)"
-        ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
-    subprocess.Popen(["powershell", "-NoProfile", "-Command", script],
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+notify = ps.notify   # Windows toast (shared with paper trading)
 
 
 class Tracker:

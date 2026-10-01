@@ -32,7 +32,10 @@ import polymarket_signals as ps
 
 DAYS_BACK = 60
 LEADERBOARD_WINDOW = 30      # monthly leaderboard: days whose trades shaped today's ranks
-CACHE = "backfill_cache.json"
+# kept outside the project folder so PyCharm doesn't index / lock this large file
+CACHE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                     "polymarket_backfill", "backfill_cache.json")
+BETS_HISTORY_DAYS = 60 + 60       # trader history fetched once (cached), enough for 60 days back
 
 
 def load_cache():
@@ -45,8 +48,15 @@ def load_cache():
 def save_cache(cache):
     cache["tags"] = {k: sorted(v) for k, v in ps._tags.items()}
     tmp = CACHE + ".tmp"
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cache, f)
+    for attempt in range(10):      # Windows: an editor / virus scanner may briefly lock it
+        try:
+            os.replace(tmp, CACHE)
+            return
+        except PermissionError:
+            time.sleep(2)
     os.replace(tmp, CACHE)
 
 
@@ -156,7 +166,7 @@ def main():
     wallets = {w for *_, info in found for w in info["backers"]}
     for n, w in enumerate(sorted(wallets), 1):
         if w not in cache["bets"]:
-            cache["bets"][w] = ps.settled_bets(w, days=DAYS_BACK + ps.LOOKBACK_DAYS,
+            cache["bets"][w] = ps.settled_bets(w, days=BETS_HISTORY_DAYS,
                                                max_pages=100)
             save_cache(cache)
         print(f"  history {n}/{len(wallets)} {names.get(w, w[:10])}", flush=True)
@@ -184,7 +194,7 @@ def main():
         end = end_ts(state)
         days_left = ps.days_until_end(state, info["trigger_ts"])
         parts.update(
-            agreement=ps.clamp((len(backers) - 1) / 3),
+            agreement=ps.agreement_part(len(backers)),
             conviction=ps.log_scale(total, *profile["conviction"]),
             consensus=total / (total + info["opposing"]),
             price=ps.clamp(0.5 - (info["entry"] - info["avg"]) * 100 / 40),
@@ -226,7 +236,46 @@ def main():
     won = sum(r["result"] == "won" for r in settled)
     print(f"\n{len(rows)} signals -> {ps.HISTORY}: {len(settled)} settled "
           f"({won} won), {len(rows) - len(settled)} still open "
-          f"({time.time() - started:.0f}s)")
+          f"({time.time() - started:.0f}s)", flush=True)
+
+    # 5. training snapshots: every top-trader position per day (1, 2, 3... traders),
+    #    built by the same replay the hourly run uses -> training.csv for model.R
+    ps._markets.update({cid: s for cid, s in cache.get("states", {}).items()})
+    training = []
+    for n, d in enumerate(days, 1):
+        day_key, day_ts = f"{d:%Y-%m-%d}", int(d.timestamp())
+        records = ps.our_records({i: r for i, (e, r) in enumerate(settled_so_far)
+                                  if e is not None and e < day_ts})
+        for group, allowed in ps.GROUPS.items():
+            trades = [(t[0], w, *t[1:]) for w, gs in groups_of.items() if group in gs
+                      for t in (cache["trades"].get(f"{w}|{day_key}") or [])
+                      if isinstance(cache["trades"].get(f"{w}|{day_key}"), list)]
+            snaps = ps.replay_day(sorted(trades, key=lambda x: x[0]), allowed)
+            for w in {w for s in snaps for w in s["backers"]} - set(cache["bets"]):
+                cache["bets"][w] = ps.settled_bets(w, days=BETS_HISTORY_DAYS,
+                                                   max_pages=100)
+                save_cache(cache)
+            training += ps.training_rows(
+                snaps, group, lambda w, ts=day_ts: stats_at(cache["bets"][w], ts), records,
+                names, live=False, lookahead=(today - d).days <= LEADERBOARD_WINDOW)
+        # remember markets that have ended (they won't change) so a re-run is quick
+        cache["states"] = {cid: s for cid, s in ps._markets.items() if s["closed"]}
+        save_cache(cache)
+        print(f"  snapshots {n}/{len(days)} {day_key}: {len(training)} rows "
+              f"({time.time() - started:.0f}s)", flush=True)
+
+    live_rows = [r for r in ps.load_training() if r["source"] == "live"]
+    ps.save_training(live_rows + training)
+    settled = [r for r in training if r["result"]]
+    by_n = defaultdict(lambda: [0, 0])
+    for r in settled:
+        k = min(int(r["num_traders"]), 4)
+        by_n[k][0] += r["result"] == "won"
+        by_n[k][1] += 1
+    print(f"\n{len(training)} snapshots -> {ps.TRAINING}: {len(settled)} settled")
+    for k in sorted(by_n):
+        print(f"  {k}{'+' if k == 4 else ''} trader(s): {by_n[k][1]} settled, "
+              f"{by_n[k][0] / by_n[k][1]:.0%} won")
 
 
 if __name__ == "__main__":
