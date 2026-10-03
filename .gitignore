@@ -33,3 +33,5 @@ plots/
 paper_daily.csv
 paper_dashboard.html
 r-library/
+patterns_report.txt
+model_history.csv

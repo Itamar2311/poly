@@ -172,6 +172,22 @@ coefs <- coef(final, s = "lambda.min")[, 1]
 cat("\nCoefficients (0 = dropped; + = raises the odds of winning beyond the price):\n")
 print(round(coefs[coefs != 0], 3))
 
+# one row per run in model_history.csv: test results + every coefficient, so you can
+# see over the weeks which effects are stable and which drift
+history_row <- data.frame(
+  trained = format(Sys.time(), "%Y-%m-%d %H:%M"), snapshots = nrow(d),
+  live_positions = round(live_positions), backfill_weight = round(backfill_weight, 3),
+  logloss_market = round(log_loss(p_market, y[test], wt), 4),
+  logloss_model = round(log_loss(p_model, y[test], wt), 4),
+  return_all = round(wmean(ret, wt), 4),
+  return_edge5 = round(wmean(ret[edge > 0.05], wt[edge > 0.05]), 4),
+  t(round(coefs, 4)), check.names = FALSE)
+if (file.exists("model_history.csv")) {
+  old <- read.csv("model_history.csv", check.names = FALSE)
+  history_row <- bind_rows(old, history_row)       # new coefficients add new columns
+}
+write.csv(history_row, "model_history.csv", row.names = FALSE, na = "")
+
 write_json(list(trained = format(Sys.time()), snapshots = nrow(d),
                 intercept = unname(coefs[1]), coefficients = as.list(coefs[-1]),
                 fills = fills),
