@@ -33,8 +33,8 @@ import polymarket_signals as ps
 DAYS_BACK = 60
 LEADERBOARD_WINDOW = 30      # monthly leaderboard: days whose trades shaped today's ranks
 # kept outside the project folder so PyCharm doesn't index / lock this large file
-CACHE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                     "polymarket_backfill", "backfill_cache.json")
+# (in the home folder, not AppData: apps like the Claude desktop app see a private AppData)
+CACHE = os.path.join(os.path.expanduser("~"), ".polymarket_backfill", "backfill_cache.json")
 BETS_HISTORY_DAYS = 60 + 60       # trader history fetched once (cached), enough for 60 days back
 
 

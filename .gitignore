@@ -32,3 +32,4 @@ plots/
 .RData
 paper_daily.csv
 paper_dashboard.html
+r-library/

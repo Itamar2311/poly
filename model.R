@@ -20,6 +20,11 @@
 #
 # Writes: model_coefficients.json, plots/coefficients.png, plots/calibration.png
 
+# packages live in the project's r-library folder, so every way of running this script
+# (RStudio, Rscript, the nightly scheduled task) finds the same ones. To set it up:
+#   install.packages(c("jsonlite","glmnet","dplyr","ggplot2"), lib = "r-library")
+if (dir.exists("r-library")) .libPaths(c(normalizePath("r-library"), .libPaths()))
+
 suppressPackageStartupMessages({
   library(jsonlite)   # parse the raw_values column (JSON text)
   library(dplyr)      # data wrangling: filter / mutate / group_by / summarise
