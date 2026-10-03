@@ -940,10 +940,32 @@ def main():
 
     import paper_trading           # approve by rule, imaginary $1 bets, track + exit
     paper = paper_trading.run(snaps, traders, records, names)
+    refit = refit_if_stale()
 
     log(f"{stamp}: {len(found)} signals today -> {OUTPUT} ({len(rows)} total), "
         f"{len(today_rows)} training snapshots today, {len(kept)} traders -> {TRADERS}; "
-        f"{learned}; {paper}")
+        f"{learned}; {paper}{refit}")
+
+
+RSCRIPT = r"C:\Program Files\R\R-4.6.1\bin\Rscript.exe"
+MODEL_MAX_AGE_HOURS = 24
+
+
+def refit_if_stale():
+    """Backup for the nightly task (which misses runs if the PC is off / asleep):
+    if the model is over a day old, start model.R + patterns.R in the background."""
+    import subprocess
+    try:
+        age = (time.time() - os.path.getmtime(MODEL_FILE)) / 3600
+    except OSError:
+        age = float("inf")
+    if age < MODEL_MAX_AGE_HOURS or not os.path.exists(RSCRIPT):
+        return ""
+    command = (f'"{RSCRIPT}" model.R >> model_log.txt 2>&1 & '
+               f'"{RSCRIPT}" patterns.R >> model_log.txt 2>&1')
+    subprocess.Popen(f'cmd /c "{command}"', cwd=os.getcwd(),
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return f"; model was {age:.0f}h old - refit started"
 
 
 def notify(title, body):
