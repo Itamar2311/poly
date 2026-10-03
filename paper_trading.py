@@ -21,8 +21,10 @@ Closed when the first of these happens:
     market settled   -> paid $1 per share if it won, $0 if it lost
     traders sold     -> more than half of the backing traders cut their position by
                         at least EXIT_SOLD_SHARE since we entered
-    edge dropped     -> model edge now < edge at entry - EXIT_EDGE_DROP
+    edge dropped     -> model edge < edge at entry - EXIT_EDGE_DROP, in EXIT_EDGE_RUNS
+                        hourly runs in a row (a brief price dip doesn't sell)
 Closed trades are sold at the current market price.
+Some categories have stricter rules on top (GROUP_RULES), e.g. weather.
 
 Files:
     paper_trades.json the record of every paper trade (the source of truth)
@@ -35,6 +37,7 @@ import csv
 import json
 import math
 import os
+from collections import defaultdict
 from datetime import datetime
 
 import polymarket_signals as ps
@@ -48,8 +51,15 @@ PRICE_RANGE = (0.10, 0.90)
 MAX_OPPOSING_SHARE = 0.20
 MIN_LIQUIDITY = 20 * STAKE
 MAX_NEW_PER_DAY = 20
-EXIT_EDGE_DROP = 0.05
+EXIT_EDGE_DROP = 0.10        # edge must fall this far below the entry edge ...
+EXIT_EDGE_RUNS = 2           # ... in this many hourly runs in a row (ignores brief dips)
 EXIT_SOLD_SHARE = 0.5
+# Stricter rules per category, on top of the ones above.
+# WEATHER: single-trader bets on exact temperature bands lost in the first days, and
+# weather traders use similar forecasts, so their bets tend to win / lose together.
+GROUP_RULES = {
+    "WEATHER": {"min_traders": 2, "min_score": 60, "max_open": 4},
+}
 # Markets on one of these topics move together even across different events (October,
 # December and January Fed meetings, "another hike in 2026"...): one open bet per topic.
 # Everything else: one open bet per event (one game, one city-day, one speech).
@@ -71,7 +81,7 @@ CANDIDATES = "candidates.csv"
 NOTIFY = True
 PAPER_FIELDS = ["trade_id", "status", "opened", "group", "topic", "event", "market", "side", "num_traders",
                 "score", "entry_price", "stake", "shares", "entry_model_prob", "entry_edge",
-                "current_price", "current_value", "profit_usd", "current_edge", "traders_sold",
+                "current_price", "current_value", "profit_usd", "current_edge", "edge_low_runs", "traders_sold",
                 "closed", "exit_price", "exit_reason", "traders", "url", "condition_id",
                 "wallets", "backer_sizes", "raw_values"]
 CANDIDATE_FIELDS = ["time", "decision", "reasons", "group", "market", "side", "num_traders",
@@ -116,7 +126,10 @@ def evaluate(group, snap, traders, records, names):
     opp_share = opposing / (total + opposing)
 
     reasons = []
-    min_score = MIN_SCORE_SINGLE if k == 1 else MIN_SCORE_GROUP
+    rules = GROUP_RULES.get(group, {})
+    if k < rules.get("min_traders", 1):
+        reasons.append(f"{group.lower()} needs {rules['min_traders']}+ traders")
+    min_score = max(MIN_SCORE_SINGLE if k == 1 else MIN_SCORE_GROUP, rules.get("min_score", 0))
     if score < min_score:
         reasons.append(f"score {score:.0f} < {min_score}")
     if edge is None:
@@ -303,8 +316,12 @@ def manage_open(trades, stamp):
         if sold > len(sizes) / 2:
             close(t, price, f"traders sold ({sold}/{len(sizes)})", stamp)
         elif edge is not None and edge < float(t["entry_edge"]) - EXIT_EDGE_DROP:
-            close(t, price, f"edge dropped {float(t['entry_edge']) * 100:+.0f} -> "
-                            f"{edge * 100:+.0f}", stamp)
+            t["edge_low_runs"] = int(t.get("edge_low_runs") or 0) + 1
+            if t["edge_low_runs"] >= EXIT_EDGE_RUNS:
+                close(t, price, f"edge dropped {float(t['entry_edge']) * 100:+.0f} -> "
+                                f"{edge * 100:+.0f} ({t['edge_low_runs']} runs)", stamp)
+        else:
+            t["edge_low_runs"] = 0             # recovered: start counting again
 
 
 def run(snaps, traders, records, names):
@@ -329,6 +346,10 @@ def run(snaps, traders, records, names):
     # one open bet per event / correlated topic (see CORRELATED_TOPICS)
     held_topics = {t["topic"] for t in trades if t["status"] == "open"}
     opened_today = sum(t["opened"].startswith(today) for t in trades)
+    open_in_group = defaultdict(int)
+    for t in trades:
+        if t["status"] == "open":
+            open_in_group[t["group"]] += 1
     new, rows = [], []
     for e in evaluated:
         event = e["market"]["slug"]
@@ -338,9 +359,14 @@ def run(snaps, traders, records, names):
                                 + ("topic" if topic.startswith("topic:") else "event"))
         if not e["reasons"] and opened_today + len(new) >= MAX_NEW_PER_DAY:
             e["reasons"].append("daily limit")
+        max_open = GROUP_RULES.get(e["group"], {}).get("max_open")
+        if not e["reasons"] and max_open is not None and \
+                open_in_group.get(e["group"], 0) >= max_open:
+            e["reasons"].append(f"{max_open} {e['group'].lower()} bets already open")
         decision = "APPROVED" if not e["reasons"] else "rejected"
         if decision == "APPROVED":
             held_topics.add(topic)
+            open_in_group[e["group"]] += 1
             new.append(e)
         rows.append({"time": stamp, "decision": decision, "reasons": "; ".join(e["reasons"]),
                      "group": e["group"], "market": e["market"]["title"], "side": e["side"],
