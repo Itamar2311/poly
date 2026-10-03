@@ -23,7 +23,8 @@ Closed when the first of these happens:
                         at least EXIT_SOLD_SHARE since we entered
     edge dropped     -> model edge < edge at entry - EXIT_EDGE_DROP, in EXIT_EDGE_RUNS
                         hourly runs in a row (a brief price dip doesn't sell)
-Closed trades are sold at the current market price.
+Closed trades are sold at the current market price. At HOLD_ABOVE (90c) or higher there
+is no early exit - the trade is held until the market settles.
 Some categories have stricter rules on top (GROUP_RULES), e.g. weather.
 
 Files:
@@ -54,6 +55,9 @@ MAX_NEW_PER_DAY = 20
 EXIT_EDGE_DROP = 0.10        # edge must fall this far below the entry edge ...
 EXIT_EDGE_RUNS = 2           # ... in this many hourly runs in a row (ignores brief dips)
 EXIT_SOLD_SHARE = 0.5
+HOLD_ABOVE = 0.90            # at this price or higher, no early exit: hold to settlement.
+# (Near 100c the model's edge falls to ~0 - nothing left to win - so "edge dropped"
+#  fired on trades that were already winning, selling them at 97-99c instead of 100c.)
 # Stricter rules per category, on top of the ones above.
 # WEATHER: single-trader bets on exact temperature bands lost in the first days, and
 # weather traders use similar forecasts, so their bets tend to win / lose together.
@@ -313,7 +317,9 @@ def manage_open(trades, stamp):
                    <= size * (1 - EXIT_SOLD_SHARE))
         t["traders_sold"] = f"{sold}/{len(sizes)}"
 
-        if sold > len(sizes) / 2:
+        if price >= HOLD_ABOVE:
+            t["edge_low_runs"] = 0             # nearly won: hold to settlement
+        elif sold > len(sizes) / 2:
             close(t, price, f"traders sold ({sold}/{len(sizes)})", stamp)
         elif edge is not None and edge < float(t["entry_edge"]) - EXIT_EDGE_DROP:
             t["edge_low_runs"] = int(t.get("edge_low_runs") or 0) + 1
