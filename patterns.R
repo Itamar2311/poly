@@ -38,7 +38,7 @@ paper <- fromJSON("paper_trades.json")$trades |>
                               grepl("^traders sold", exit_reason) ~ "traders sold",
                               TRUE ~ "market settled"),
          price    = price_bands(entry_price),
-         edge     = band(entry_edge, c(-1, .15, .25, 1), c("10-15", "15-25", "25+")),
+         edge     = band(entry_edge, c(-1, .10, .15, .25, 1), c("5-10", "10-15", "15-25", "25+")),
          traders  = ifelse(num_traders >= 3, "3+", as.character(num_traders)))
 
 summarise_paper <- function(df, by) df |>

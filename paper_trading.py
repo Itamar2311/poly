@@ -46,7 +46,9 @@ import polymarket_signals as ps
 STAKE = 1.0
 MIN_SCORE_SINGLE = 55
 MIN_SCORE_GROUP = 55          # 2+ traders
-MIN_EDGE = 0.10
+MIN_EDGE = 0.05              # paper phase: low on purpose, to collect data faster.
+                             # For real money use 0.10+ until patterns.R ("by edge")
+                             # shows which level actually makes money.
 MAX_REALISTIC_EDGE = 0.35
 PRICE_RANGE = (0.10, 0.90)
 MAX_OPPOSING_SHARE = 0.20
